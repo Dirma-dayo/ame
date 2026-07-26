@@ -1,0 +1,33 @@
+[package]
+name = "petto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# GUI
+eframe = "0.33"
+egui = "0.33"
+
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Images
+image = "0.25"
+
+# Errors
+anyhow = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Recursive directory walking
+walkdir = "2"
+
+# Random events later
+rand = "0.9"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+ureq = { version = "2", features = ["json"] }
