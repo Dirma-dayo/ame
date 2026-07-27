@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use chrono::Timelike;
 
 use crate::{
     animation::AnimationPlayer,
@@ -17,6 +18,67 @@ use eframe::egui::{self, Context};
 // `log_sent`), so this is mostly a safety net against pathological
 // growth rather than the primary size control.
 const MAX_RAW_LOG_ENTRIES: usize = 200;
+
+// Sticker sets. Ame's are picked autonomously by the LLM (see the
+// system prompt / `LlmReply::sticker`); pchan's are sent manually via
+// the picker in the chat window's input bar. These lists exist so the
+// system prompt can enumerate exactly what Ame is allowed to pick, and
+// so the picker UI has a fixed, ordered set to render — the actual
+// texture lookup still goes through `Assets::ame_stickers` /
+// `Assets::pchan_stickers`, so a name here with no matching PNG just
+// quietly fails to render rather than panicking.
+const AME_STICKERS: &[&str] = &[
+    "aseru", "ignoring_u", "im_orb", "selfie_time", "so_NOT_cute", "toketeiru", "zzz",
+];
+const PCHAN_STICKERS: &[&str] = &[
+    "idc", "im_ded", "love_forever", "omg", "sad", "sorry", "this", "tired_ok",
+];
+
+// Sticker images are rendered at a fixed size in the chat log,
+// independent of the text bubble width.
+const STICKER_SIZE: f32 = 96.0;
+
+/// UI-facing chat entry. Separate from `ChatMessage` (the LLM wire
+/// format) because a bubble can now be plain text or a sticker image,
+/// and only text ever needs to round-trip through the model as prose.
+#[derive(Debug, Clone)]
+enum DisplayContent {
+    Text(String),
+    Sticker(String), // file stem, e.g. "aseru"
+}
+
+#[derive(Debug, Clone)]
+struct DisplayMessage {
+    role: &'static str, // "user" | "assistant"
+    content: DisplayContent,
+}
+
+impl DisplayMessage {
+    fn user_text(s: impl Into<String>) -> Self {
+        Self {
+            role: "user",
+            content: DisplayContent::Text(s.into()),
+        }
+    }
+    fn assistant_text(s: impl Into<String>) -> Self {
+        Self {
+            role: "assistant",
+            content: DisplayContent::Text(s.into()),
+        }
+    }
+    fn user_sticker(name: impl Into<String>) -> Self {
+        Self {
+            role: "user",
+            content: DisplayContent::Sticker(name.into()),
+        }
+    }
+    fn assistant_sticker(name: impl Into<String>) -> Self {
+        Self {
+            role: "assistant",
+            content: DisplayContent::Sticker(name.into()),
+        }
+    }
+}
 
 pub struct PetApp {
     assets: Assets,
@@ -44,10 +106,11 @@ pub struct PetApp {
     conversation: Vec<ChatMessage>,
     examples: Vec<ChatMessage>,
 
-    // UI-facing history for the Jine chat window: plain, human-readable
-    // text per bubble (no JSON envelope, no system-role entries). This
-    // is deliberately a separate list from `conversation` now.
-    display_log: Vec<ChatMessage>,
+    // UI-facing history for the Jine chat window: one entry per bubble,
+    // either plain text or a sticker image (no JSON envelope, no
+    // system-role entries). Deliberately a separate list from
+    // `conversation`.
+    display_log: Vec<DisplayMessage>,
 
     input: String,
     waiting_for_reply: bool,
@@ -56,6 +119,8 @@ pub struct PetApp {
     chat_window_open: bool,
     // Whether the "Task Manager" (closeness/stress) window is shown.
     task_manager_open: bool,
+    // Whether pchan's sticker picker popup is currently shown.
+    sticker_picker_open: bool,
 
     // Hidden debug window: raw JSON sent to / received from the LLM.
     // Not shown by default — toggled with 'O'.
@@ -94,6 +159,21 @@ impl PetApp {
              should still be a single string. \
              do NOT ever send a JSON array of objects, only a single object with a \"reply\" \
              do NOT ever use emoji \
+             You also have a small set of stickers you can send: aseru, \
+             ignoring_u, im_orb, selfie_time, so_NOT_cute, toketeiru, zzz \
+             — think of them as short mood/reaction images. Include a \
+             \"sticker\" field ONLY when one genuinely fits the moment; \
+             this should be rare, most replies send no sticker at all. \
+             Omit the field or set it to null otherwise. Never invent a \
+             sticker name outside this exact list. If a message tells \
+             you the user sent a sticker, react to it the way you'd \
+             react to a little picture they shared. \
+             Before most replies you'll get a system note with the real \
+             current time and day. Only bring it up when it actually fits \
+             — being sleepy late at night, greeting a new day, noting \
+             it's the weekend — most replies shouldn't mention it at all, \
+             and you should never state the exact time/date like a clock \
+             or acknowledge that you were told it. \
              Sometimes you'll get a system note saying the user hasn't \
              talked to you in a while — when that happens, initiate a \
              short, natural message first, as if reaching out on your \
@@ -102,7 +182,8 @@ impl PetApp {
              markdown fences, in exactly this shape: \
              {\"reply\": \"<your 1-2 sentence reply>\" or [\"<msg1>\", \
              \"<msg2>\", ...], \"mood\": \"<one of: worried, excited, \
-             disappointed, pissed_off, neutral>\"}",
+             disappointed, pissed_off, neutral>\", \"sticker\": \"<one \
+             of the sticker names above>\" or null}",
         )];
 
         let examples = load_example_dialogue("assets/examples.txt")
@@ -142,6 +223,7 @@ impl PetApp {
             waiting_for_reply: false,
             chat_window_open: true,
             task_manager_open: true,
+            sticker_picker_open: false,
 
             raw_history_open: false,
             raw_log: Vec::new(),
@@ -238,12 +320,37 @@ impl PetApp {
 
         self.input.clear();
         self.conversation.push(ChatMessage::user(text.clone()));
-        self.display_log.push(ChatMessage::user(text));
+        self.display_log.push(DisplayMessage::user_text(text));
         self.state.record_chat_interaction();
 
         // system prompt + few-shot examples + real conversation history.
         // self.conversation stays as just [system, ...real history] so
         // examples never get saved/duplicated across turns.
+        let mut messages = vec![self.conversation[0].clone()];
+        messages.extend(self.examples.clone());
+        messages.extend(self.conversation[1..].to_vec());
+        messages.push(ChatMessage::system(current_time_context()));
+
+        self.log_sent(&messages);
+        self.llm.ask(messages);
+
+        self.waiting_for_reply = true;
+        self.state.set_activity(Activity::PhoneChat);
+    }
+
+    /// pchan picked a sticker from the picker. Tells the model a sticker
+    /// was sent (as a plain text note, since the LLM only deals in
+    /// prose/JSON) and renders the actual image in `display_log`.
+    fn send_sticker(&mut self, name: String) {
+        if self.waiting_for_reply {
+            return;
+        }
+
+        self.conversation
+            .push(ChatMessage::user(format!("[pchan sent a sticker: {name}]")));
+        self.display_log.push(DisplayMessage::user_sticker(name));
+        self.state.record_chat_interaction();
+
         let mut messages = vec![self.conversation[0].clone()];
         messages.extend(self.examples.clone());
         messages.extend(self.conversation[1..].to_vec());
@@ -320,9 +427,20 @@ impl PetApp {
 
                 let first = bubbles.remove(0);
 
-                self.display_log.push(ChatMessage::assistant(first.clone()));
+                self.display_log
+                    .push(DisplayMessage::assistant_text(first.clone()));
                 self.state.show_reply(first, 6.0);
                 self.state.set_mood(mood, &self.assets.animations);
+
+                // Only render it if it's a name we actually have an
+                // asset for — a small local model can still hallucinate
+                // outside the allowed list.
+                if let Some(sticker) = parsed.sticker.as_deref() {
+                    if self.assets.ame_stickers.contains_key(sticker) {
+                        self.display_log
+                            .push(DisplayMessage::assistant_sticker(sticker.to_string()));
+                    }
+                }
 
                 self.pending_bubbles = bubbles.into_iter().collect();
                 self.bubble_timer = 0.0; // fire first queued bubble soon
@@ -356,7 +474,8 @@ impl PetApp {
 
         if let Some(next) = self.pending_bubbles.pop_front() {
             self.bubble_timer = typing_delay(&next);
-            self.display_log.push(ChatMessage::assistant(next.clone()));
+            self.display_log
+                .push(DisplayMessage::assistant_text(next.clone()));
             self.state.show_reply(next, 6.0);
         }
     }
@@ -408,9 +527,10 @@ impl PetApp {
         }
     }
 
-    /// The actual contents of the chat window: hand-painted titlebar,
-    /// scrolling message log with avatar/bubbles, and a bottom bar with
-    /// the model picker + text input.
+    /// The actual contents of the chat window: hand-painted titlebar
+    /// (with the settings gear now docked into it), scrolling message
+    /// log with avatar/bubbles/stickers, a sticker picker popup, and a
+    /// bottom bar with the model picker + sticker button + text input.
     fn chat_ui(&mut self, ui: &mut egui::Ui, ctx: &Context, should_close: &mut bool) {
         let rect = ui.max_rect();
 
@@ -421,6 +541,42 @@ impl PetApp {
 
         let title_bar_rect =
             draw_mini_titlebar(ui, ctx, rect, "chat", "JINE", should_close);
+
+        // Settings gear, docked into the titlebar just left of the
+        // minimize/maximize/close cluster (moved here from the input
+        // bar so it reads as window chrome rather than a chat control).
+        {
+            let gear_size = egui::vec2(20.0, 18.0);
+            let controls_width = (20.0 + 4.0) * 3.0; // matches the 3 buttons drawn in draw_mini_titlebar
+            let gear_x = title_bar_rect.max.x - 6.0 - controls_width - 6.0 - gear_size.x;
+            let gear_rect = egui::Rect::from_min_size(
+                egui::pos2(gear_x, title_bar_rect.min.y + 5.0),
+                gear_size,
+            );
+            let resp = ui.interact(
+                gear_rect,
+                ui.id().with(("chat", "titlebar_settings")),
+                egui::Sense::click(),
+            );
+            let base = egui::Color32::from_rgb(90, 90, 130);
+            let color = if resp.hovered() {
+                base.gamma_multiply(1.3)
+            } else {
+                base
+            };
+            ui.painter().rect_filled(gear_rect, 3.0, color);
+            ui.painter().text(
+                gear_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "\u{2699}", // ⚙
+                egui::FontId::monospace(12.0),
+                egui::Color32::WHITE,
+            );
+            if resp.clicked() {
+                self.proxy_input = self.proxy.clone();
+                self.settings_open = true;
+            }
+        }
 
         // --- Body: chat log + input bar ---------------------------------
         let body_rect =
@@ -445,15 +601,24 @@ impl PetApp {
                 ui.add_space(12.0);
                 ui.set_width(chat_area_rect.width());
 
-                // display_log holds only real user/assistant turns as
-                // plain text — no system prompt, no JSON envelope, no
-                // system-role idle-initiation nudges — so no filtering
-                // needed here.
+                // display_log holds only real user/assistant turns — no
+                // system prompt, no JSON envelope, no system-role
+                // idle-initiation nudges — so no filtering needed here.
                 for message in self.display_log.iter() {
-                    match message.role.as_str() {
-                        "user" => draw_user_bubble(ui, &message.content),
-                        "assistant" => {
-                            draw_assistant_bubble(ui, &self.assets.chat_avatar, &message.content)
+                    match (&message.content, message.role) {
+                        (DisplayContent::Text(text), "user") => draw_user_bubble(ui, text),
+                        (DisplayContent::Text(text), "assistant") => {
+                            draw_assistant_bubble(ui, &self.assets.chat_avatar, text)
+                        }
+                        (DisplayContent::Sticker(name), "user") => {
+                            if let Some(tex) = self.assets.pchan_stickers.get(name.as_str()) {
+                                draw_user_sticker(ui, tex);
+                            }
+                        }
+                        (DisplayContent::Sticker(name), "assistant") => {
+                            if let Some(tex) = self.assets.ame_stickers.get(name.as_str()) {
+                                draw_assistant_sticker(ui, &self.assets.chat_avatar, tex);
+                            }
                         }
                         _ => {}
                     }
@@ -472,25 +637,31 @@ impl PetApp {
             .show(&mut input_ui, |ui| {
                 let previous = self.selected_model.clone();
 
-                egui::ComboBox::from_id_salt("model_select")
-                    .selected_text(&self.selected_model)
-                    .show_ui(ui, |ui| {
-                        for model in &self.available_models {
-                            ui.selectable_value(&mut self.selected_model, model.clone(), model);
-                        }
-                    });
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("model_select")
+                        .selected_text(&self.selected_model)
+                        .show_ui(ui, |ui| {
+                            for model in &self.available_models {
+                                ui.selectable_value(
+                                    &mut self.selected_model,
+                                    model.clone(),
+                                    model,
+                                );
+                            }
+                        });
+
+                    if ui
+                        .button("\u{1F380}") // 🎀
+                        .on_hover_text("Send a sticker")
+                        .clicked()
+                    {
+                        self.sticker_picker_open = !self.sticker_picker_open;
+                    }
+                });
 
                 if previous != self.selected_model {
                     self.change_model(self.selected_model.clone());
                 }
-
-                // Settings gear, directly above the Send row.
-                ui.horizontal(|ui| {
-                    if ui.button("⚙ Settings").clicked() {
-                        self.proxy_input = self.proxy.clone();
-                        self.settings_open = true;
-                    }
-                });
 
                 ui.horizontal(|ui| {
                     let response = ui.add_sized(
@@ -511,6 +682,62 @@ impl PetApp {
                     }
                 });
             });
+
+        // pchan's manual sticker picker, anchored just above the input
+        // bar. Separate from the input frame above so it floats over
+        // the chat log instead of squeezing the layout.
+        if self.sticker_picker_open {
+            let mut close_picker = false;
+            let mut clicked: Option<String> = None;
+
+            egui::Window::new("pchan_sticker_picker")
+                .title_bar(false)
+                .resizable(false)
+                .collapsible(false)
+                .fixed_size([200.0, 190.0])
+                .anchor(
+                    egui::Align2::RIGHT_BOTTOM,
+                    egui::vec2(-8.0, -(input_bar_height + 8.0)),
+                )
+                .show(ctx, |ui| {
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 44, 240))
+                        .corner_radius(8.0)
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Send a sticker")
+                                        .color(egui::Color32::WHITE)
+                                        .size(12.0),
+                                );
+                                if ui.small_button("\u{2715}").clicked() {
+                                    close_picker = true;
+                                }
+                            });
+                            ui.separator();
+                            ui.horizontal_wrapped(|ui| {
+                                for name in PCHAN_STICKERS {
+                                    if let Some(tex) = self.assets.pchan_stickers.get(*name) {
+                                        let resp =
+                                            ui.add(egui::ImageButton::new(tex).frame(false));
+                                        if resp.clicked() {
+                                            clicked = Some((*name).to_string());
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                });
+
+            if close_picker {
+                self.sticker_picker_open = false;
+            }
+            if let Some(name) = clicked {
+                self.sticker_picker_open = false;
+                self.send_sticker(name);
+            }
+        }
     }
 
     /// Opens (or keeps open) the "Task Manager" window: a small always-
@@ -910,6 +1137,31 @@ fn typing_delay(text: &str) -> f32 {
     (0.5 + text.chars().count() as f32 * 0.025).clamp(0.9, 3.2)
 }
 
+/// Ephemeral system note giving the model the real current time/day.
+/// Rebuilt fresh on every send and appended to the outgoing messages
+/// only — never pushed into `self.conversation` — so it's always
+/// accurate and doesn't leave a stale timestamp sitting in history.
+fn current_time_context() -> String {
+    let now = chrono::Local::now();
+    let part_of_day = match now.hour() {
+        5..=11 => "morning",
+        12..=16 => "afternoon",
+        17..=20 => "evening",
+        _ => "late at night",
+    };
+
+    format!(
+        "[System note: the real-world time right now is {} ({}), on {}. \
+         Weave this in naturally only if it genuinely fits — noticing \
+         it's late, commenting on a weekend, etc. Don't recite the time \
+         like a clock, don't treat this as something the user said, and \
+         never mention receiving this note.]",
+        now.format("%I:%M %p"),
+        part_of_day,
+        now.format("%A")
+    )
+}
+
 // Max width of a bubble's text content, not counting the frame's margin.
 const BUBBLE_TEXT_WIDTH: f32 = 220.0;
 
@@ -962,6 +1214,40 @@ fn draw_user_bubble(ui: &mut egui::Ui, text: &str) {
             .show(ui, |ui| {
                 wrapped_bubble_text(ui, text, egui::Color32::from_rgb(20, 40, 10));
             });
+    });
+}
+
+/// Left-aligned sticker with the pet's avatar, for Ame's LLM-picked
+/// stickers. No text frame/background — the sticker image is the
+/// whole bubble.
+fn draw_assistant_sticker(
+    ui: &mut egui::Ui,
+    avatar: &egui::TextureHandle,
+    sticker: &egui::TextureHandle,
+) {
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::Image::new(avatar)
+                .texture_options(egui::TextureOptions::NEAREST)
+                .fit_to_exact_size(egui::vec2(36.0, 36.0))
+                .corner_radius(18.0),
+        );
+        ui.add(
+            egui::Image::new(sticker)
+                .texture_options(egui::TextureOptions::NEAREST)
+                .fit_to_exact_size(egui::vec2(STICKER_SIZE, STICKER_SIZE)),
+        );
+    });
+}
+
+/// Right-aligned sticker, no avatar, for pchan's manually-sent stickers.
+fn draw_user_sticker(ui: &mut egui::Ui, sticker: &egui::TextureHandle) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+        ui.add(
+            egui::Image::new(sticker)
+                .texture_options(egui::TextureOptions::NEAREST)
+                .fit_to_exact_size(egui::vec2(STICKER_SIZE, STICKER_SIZE)),
+        );
     });
 }
 
@@ -1025,8 +1311,8 @@ impl eframe::App for PetApp {
 
         //
         // Draw the separate "Jine"-style chat window (text in/out +
-        // model picker). Lives in its own OS window, not overlaid on
-        // the pet anymore.
+        // model picker + sticker picker). Lives in its own OS window,
+        // not overlaid on the pet anymore.
         //
         self.draw_chat_window(ctx);
 

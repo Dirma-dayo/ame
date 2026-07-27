@@ -47,6 +47,19 @@ pub fn load_example_dialogue(path: impl AsRef<Path>) -> Result<Vec<ChatMessage>>
     Ok(messages)
 }
 
+/// The structured shape the model's replies are parsed into. `sticker`
+/// is optional — Ame only includes it when she wants to send one (see
+/// the system prompt in app.rs), and `#[serde(default)]` means it's
+/// simply `None` for every reply that omits or nulls the field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmReply {
+    pub reply: ReplyContent,
+    #[serde(default)]
+    pub mood: String,
+    #[serde(default)]
+    pub sticker: Option<String>,
+}
+
 /// Wraps a raw example line into the `{"reply": ..., "mood": "neutral"}`
 /// envelope. If the line already looks like a JSON array (our
 /// multi-bubble examples, e.g. `["hi.", "hi again."]`), it's parsed and
@@ -132,13 +145,6 @@ impl ReplyContent {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LlmReply {
-    pub reply: ReplyContent,
-    #[serde(default)]
-    pub mood: String,
-}
-
 /// Robustly extracts an `LlmReply` from whatever the model actually sent
 /// back. Local models don't always follow the requested JSON shape
 /// exactly — sometimes it's a bare `["msg1", "msg2"]` with no envelope,
@@ -162,6 +168,7 @@ pub fn parse_llm_reply(raw: &str) -> LlmReply {
     LlmReply {
         reply: ReplyContent::Single(raw.trim().to_string()),
         mood: "neutral".to_string(),
+        sticker: None,
     }
 }
 
@@ -181,6 +188,7 @@ fn llm_reply_from_value(value: serde_json::Value, raw: &str) -> LlmReply {
         serde_json::Value::Object(_) => serde_json::from_value(value).unwrap_or_else(|_| LlmReply {
             reply: ReplyContent::Single(raw.trim().to_string()),
             mood: "neutral".to_string(),
+            sticker: None,
         }),
         serde_json::Value::Array(items) => {
             let strings: Vec<String> = items
@@ -190,15 +198,18 @@ fn llm_reply_from_value(value: serde_json::Value, raw: &str) -> LlmReply {
             LlmReply {
                 reply: ReplyContent::Multi(strings),
                 mood: "neutral".to_string(),
+                sticker: None,
             }
         }
         serde_json::Value::String(s) => LlmReply {
             reply: ReplyContent::Single(s),
             mood: "neutral".to_string(),
+            sticker: None,
         },
         other => LlmReply {
             reply: ReplyContent::Single(other.to_string()),
             mood: "neutral".to_string(),
+            sticker: None,
         },
     }
 }
@@ -213,7 +224,7 @@ struct ModelInfo {
     name: String,
 }
 /// Default Ollama endpoint, used whenever the proxy field is empty.
-pub const DEFAULT_BASE_URL: &str = "http://localhost:11434";
+pub const DEFAULT_BASE_URL: &str = "http://localhost:8080";
 
 pub struct OllamaClient {
     base_url: String,
@@ -298,7 +309,6 @@ impl LlmWorker {
         Self { tx: req_tx, rx: res_rx }
     }
     // ask()/poll() unchanged
-
 
     pub fn ask(&self, messages: Vec<ChatMessage>) {
         let _ = self.tx.send(messages);

@@ -344,10 +344,10 @@ impl PetState {
             Relationship::F => "You're stressed and a bit on edge right now.",
         };
 
-        format!(
+        return format!(
             "[Current state] closeness: {:.0}/100, stress: {:.0}/100. {}",
             self.closeness, self.stress, tier_desc
-        )
+        );
     }
 
     /// Show a reply bubble for `seconds` seconds.

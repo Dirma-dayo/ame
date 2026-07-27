@@ -27,6 +27,11 @@ pub struct Assets {
     // Assets for the "Task Manager" window (closeness/stress readout).
     pub closeness_icon: TextureHandle,
     pub stress_icon: TextureHandle,
+
+    // Ame's stickers (LLM-picked) and pchan's stickers (manual picker),
+    // keyed by filename stem, e.g. "aseru" -> aseru.png.
+    pub ame_stickers: HashMap<String, TextureHandle>,
+    pub pchan_stickers: HashMap<String, TextureHandle>,
 }
 
 impl Assets {
@@ -93,6 +98,18 @@ impl Assets {
             Path::new("assets/task_manager/stress_icon.png"),
         )?;
 
+        // Sticker sets. Directory names match what you already have:
+        // assets/chat/stickers/ame-only, assets/chat/stickers/pchanonly.
+        let ame_stickers = load_stickers(
+            ctx,
+            Path::new("assets/chat/stickers/ame-only"),
+        )?;
+
+        let pchan_stickers = load_stickers(
+            ctx,
+            Path::new("assets/chat/stickers/pchanonly"),
+        )?;
+
         Ok(Self {
             background,
             screensavers,
@@ -101,8 +118,44 @@ impl Assets {
             chat_avatar,
             closeness_icon,
             stress_icon,
+            ame_stickers,
+            pchan_stickers,
         })
     }
+}
+
+fn load_stickers(ctx: &EguiContext, dir: &Path) -> Result<HashMap<String, TextureHandle>> {
+    let mut stickers = HashMap::new();
+
+    if !dir.exists() {
+        // Not fatal — lets the app still run before sticker folders exist.
+        eprintln!("Sticker folder missing, skipping: {:?}", dir);
+        return Ok(stickers);
+    }
+
+    for entry in WalkDir::new(dir) {
+        let entry = entry?;
+
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+
+        if path.extension().and_then(|s| s.to_str()) != Some("png") {
+            continue;
+        }
+
+        let name = path
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        stickers.insert(name.clone(), load_texture(ctx, &name, path)?);
+    }
+
+    Ok(stickers)
 }
 
 fn discover_animations(
